@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -11,6 +12,9 @@ DATA_DIR = "data"
 CSV_RECORD_FILE = os.path.join(DATA_DIR, "customer_records.csv")
 DB_FILE = os.path.join(DATA_DIR, "customer_records.db")
 ADMIN_CODE = "csair123"
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 
 def init_session_state():
@@ -24,6 +28,7 @@ def init_session_state():
         "admin_authenticated": False,
         "pending_delete_index": None,
         "pending_delete_label": "",
+        "pending_remove_journey": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -36,7 +41,7 @@ def go_home():
 
 
 def go_next():
-    st.session_state.step = min(6, st.session_state.step + 1)
+    st.session_state.step = min(3, st.session_state.step + 1)
 
 
 def go_back():
@@ -46,12 +51,14 @@ def go_back():
 def reset_form():
     form_keys = [
         "contact_name", "phone", "organization", "role", "city", "customer_type",
-        "org_size", "existing_channel", "reach_ability", "platforms",
-        "travel_types", "ticketing_scenario", "demand_sources", "fixed_plan", "travel_frequency", "single_trip_people", "annual_trips",
-        "departure_city", "arrival_cities", "route_need", "route_detail", "time_preferences", "group_travel",
-        "rights_focus", "compliance_support", "data_reconciliation", "proof_materials",
+        "travel_scene", "travel_types", "companion_count_range", "single_trip_people",
+        "fixed_plan", "reach_ability", "journey_count", "start_time",
+        "rights_focus", "compliance_support", "compliance_detail", "proof_materials",
         "cooperation_goal", "start_time", "remarks", "analysis_agreement", "admin_code_input",
     ]
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("journey_"):
+            form_keys.append(key)
     for key in form_keys:
         st.session_state.pop(key, None)
     st.session_state.answers = {}
@@ -84,6 +91,297 @@ def parse_json_field(value, default):
         return default
 
 
+def normalize_list(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def normalize_text(value):
+    if isinstance(value, list):
+        return "；".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def get_primary_journey(answers: dict) -> dict:
+    journeys = answers.get("journeys") or []
+    return journeys[0] if journeys else {}
+
+
+def split_city_text(value: str) -> list:
+    normalized = str(value or "").replace("，", ",").replace("、", ",").replace("；", ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def infer_ticketing_scenario(travel_scene: str) -> str:
+    mapping = {
+        "公务差旅": "公商务出票",
+        "商务拜访": "公商务出票",
+        "会议会展": "会议会展出票",
+        "团队活动": "客户需求代订 / 渠道出票",
+        "学术交流": "公商务出票",
+        "校友活动": "客户需求代订 / 渠道出票",
+        "文旅出行": "旅游团队出票",
+        "员工福利或客户答谢": "员工福利 / 客户答谢出行",
+        "个人及家庭出行": "个人会员出行",
+    }
+    return mapping.get(travel_scene, "其他")
+
+
+def infer_demand_sources(customer_type: str, travel_scene: str) -> list:
+    sources = []
+    if customer_type == "企业客户":
+        sources.append("企业员工差旅需求")
+    if customer_type == "政府或事业单位":
+        sources.append("政府 / 事业单位公务需求")
+    if customer_type == "高校或校友会" or travel_scene in ["学术交流", "校友活动"]:
+        sources.append("会议会展参会需求")
+    if travel_scene in ["团队活动", "文旅出行"]:
+        sources.append("旅行 / 活动团队需求")
+    if travel_scene == "个人及家庭出行":
+        sources.append("个人及家庭出行需求")
+    return sources
+
+
+def normalize_answers_for_scoring(answers: dict) -> dict:
+    normalized = dict(answers)
+    journey = get_primary_journey(answers)
+    journeys = answers.get("journeys") or []
+    travel_scene_map = {
+        "校友活动": "校友返校 / 校友活动",
+        "员工福利或客户答谢": "客户答谢 / 员工福利",
+    }
+    travel_scene = travel_scene_map.get(answers.get("travel_scene") or "", answers.get("travel_scene") or "")
+    customer_type_map = {
+        "政府或事业单位": "政府 / 事业单位",
+        "高校或校友会": "高校 / 校友会",
+        "协会、商会或社团": "协会 / 商会 / 社团",
+        "文旅、会展或活动合作方": "文旅 / 会展 / 活动合作方",
+    }
+    normalized["customer_type"] = customer_type_map.get(answers.get("customer_type", ""), answers.get("customer_type", ""))
+    normalized["travel_types"] = answers.get("travel_types") or ([travel_scene] if travel_scene else [])
+    fixed_plan_map = {
+        "已明确固定行程": "有明确固定行程",
+        "有大致计划但日期未定": "有年度 / 季度计划但日期未定",
+    }
+    normalized["fixed_plan"] = fixed_plan_map.get(answers.get("fixed_plan", ""), answers.get("fixed_plan", ""))
+    rights_map = {
+        "专属活动页或入口": "专属活动页面或入口",
+    }
+    normalized["rights_focus"] = [rights_map.get(item, item) for item in (answers.get("rights_focus") or [])]
+    normalized["ticketing_scenario"] = answers.get("ticketing_scenario") or infer_ticketing_scenario(travel_scene)
+    normalized["demand_sources"] = answers.get("demand_sources") or infer_demand_sources(normalized.get("customer_type", ""), travel_scene)
+    normalized["travel_frequency"] = answers.get("travel_frequency") or journey.get("travel_frequency", "")
+    normalized["departure_city"] = answers.get("departure_city") or journey.get("departure_city", "")
+    normalized["arrival_cities"] = answers.get("arrival_cities") or journey.get("arrival_cities", "")
+    normalized["time_preferences"] = answers.get("time_preferences") or journey.get("time_preferences", [])
+    normalized["group_travel"] = answers.get("group_travel") or journey.get("group_travel", "")
+    normalized["route_detail"] = answers.get("route_detail") or "；".join(
+        f"{item.get('departure_city', '')}-{item.get('arrival_cities', '')}".strip("-")
+        for item in journeys
+        if item.get("departure_city") or item.get("arrival_cities")
+    )
+    normalized["route_need"] = "有，非常明确" if normalized.get("route_detail") else "暂无明确航线"
+    try:
+        normalized["single_trip_people"] = int(answers.get("single_trip_people") or 0)
+    except Exception:
+        normalized["single_trip_people"] = 0
+    frequency_factor = {
+        "单次": 1,
+        "每周多次": 80,
+        "每月多次": 24,
+        "每季度多次": 8,
+        "每年数次": 3,
+        "不确定": 1,
+    }.get(normalized.get("travel_frequency"), 1)
+    normalized["annual_trips"] = int(answers.get("annual_trips") or normalized["single_trip_people"] * frequency_factor)
+    normalized["org_size"] = answers.get("org_size") or (
+        "1000人以上" if normalized["single_trip_people"] >= 200 else
+        "200-1000人" if normalized["single_trip_people"] >= 50 else
+        "50-200人" if normalized["single_trip_people"] >= 10 else
+        "50人以下"
+    )
+    normalized["platforms"] = answers.get("platforms") or []
+    normalized["data_reconciliation"] = answers.get("data_reconciliation") or (
+        "偶尔需要" if answers.get("compliance_support") in ["涉及，需要", "不确定"] else "不需要"
+    )
+    return normalized
+
+
+def extract_json_object(text: str):
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except Exception:
+                return {}
+    return {}
+
+
+def build_rule_profile_summary(result: dict) -> str:
+    score_detail = result.get("score_detail", {})
+    tags = "、".join(result.get("tags", [])) or "待进一步沟通"
+    risks = "；".join(result.get("risk_notes", [])) or "暂无明显风险"
+    return (
+        f"系统规则判断该客户为{result.get('customer_segment', '未分类')}，"
+        f"匹配等级为{result.get('match_level', '未评级')}，综合评分{result.get('score', 0)}分。"
+        f"推荐政策方向为{result.get('recommended_policy', '待确认')}。"
+        f"主要标签：{tags}。待核实事项：{risks}。"
+        f"评分明细：{json.dumps(score_detail, ensure_ascii=False)}"
+    )
+
+
+def generate_quote_result(answers: dict, result: dict) -> dict:
+    normalized = normalize_answers_for_scoring(answers)
+    score = int(result.get("score", 0) or 0)
+    people = int(normalized.get("single_trip_people", 0) or 0)
+    start_time = normalized.get("start_time", "")
+    fixed_plan = normalized.get("fixed_plan", "")
+    rights = normalized.get("rights_focus", [])
+    compliance = normalized.get("compliance_support", "")
+    risks = result.get("risk_notes", []) or []
+
+    if score >= 80:
+        discount = "7.5-8.5折"
+        plan = "重点合作报价方案"
+    elif score >= 60:
+        discount = "8-9折"
+        plan = "团队/差旅合作报价方案"
+    elif score >= 40:
+        discount = "9-9.5折"
+        plan = "基础合作报价方案"
+    else:
+        discount = "以实时票价及会员权益为准"
+        plan = "普通出行权益参考方案"
+
+    if people >= 50 and "团队票支持" in rights:
+        plan = "团队出行报价方案"
+    if compliance in ["涉及，需要", "是，需要"]:
+        plan = f"{plan}（含合规材料支持）"
+
+    confidence = "高"
+    if risks or fixed_plan in ["暂无明确计划", ""] or start_time == "暂不确定":
+        confidence = "中"
+    if len(risks) >= 3 or people <= 0:
+        confidence = "低"
+
+    review_required = confidence == "低" or bool(risks)
+    customer_tip = f"本次出行可优先参考{plan}，预计可享受{discount}的合作优惠，最终价格需结合实际航班、舱位、人数和出票时间确认。"
+    if review_required:
+        customer_tip = "您的需求已提交，因部分信息仍需确认，客户经理将结合航线、人数和材料情况为您提供更准确的报价参考。"
+
+    return {
+        "quote_plan": plan,
+        "quote_range": discount,
+        "customer_tip": customer_tip,
+        "quote_confidence": confidence,
+        "manual_review_required": review_required,
+        "quote_basis": [
+            f"综合评分：{score}",
+            f"同行人数：{people or '待确认'}",
+            f"行程确定度：{fixed_plan or '待确认'}",
+            f"启动时间：{start_time or '待确认'}",
+            f"权益偏好：{list_to_text(rights) or '待确认'}",
+        ],
+    }
+
+
+def build_fallback_ai_profile(result: dict, status: str, error: str = "") -> dict:
+    return {
+        "ai_status": status,
+        "ai_error": error,
+        "ai_profile": build_rule_profile_summary(result),
+        "ai_suggestions": "；".join(result.get("next_actions", [])),
+        "ai_opportunities": result.get("reason", []),
+        "ai_risk_review": result.get("risk_notes", []),
+        "ai_follow_up_questions": [
+            "请进一步确认重点航线、预计出行人数和启动时间。",
+            "请补充可提供的合作证明材料或组织证明。",
+        ],
+        "ai_confidence": "规则兜底",
+    }
+
+
+def call_deepseek_customer_profile(answers: dict, result: dict) -> dict:
+    api_key = DEEPSEEK_API_KEY.strip()
+    if not api_key:
+        return build_fallback_ai_profile(result, "未启用", "未配置 DEEPSEEK_API_KEY")
+
+    system_prompt = (
+        "你是南方航空新型渠道合作客户画像分析助手。"
+        "请基于客户问卷答案、多个行程信息和系统规则评分，生成可供南航内部客户经理查看的客户画像。"
+        "客户画像请突出客户身份、出行场景、同行规模、主要航线、时间偏好、合作诉求和报价策略参考。"
+        "必须严格输出 JSON，不要输出 Markdown，不要输出解释性前后缀。"
+        "JSON 字段包括："
+        "customer_profile 字符串；"
+        "suggestions 字符串，给客户经理的具体跟进建议，用一段完整自然语言表达，约100字，不要分条；"
+        "opportunity_points 字符串数组，合作机会点；"
+        "risk_review 字符串数组，待核实风险或不确定事项；"
+        "follow_up_questions 字符串数组，建议下一步询问客户的问题；"
+        "confidence 字符串，只能是 高、中、低。"
+    )
+    user_payload = {
+        "customer_answers": answers,
+        "rule_result": result,
+    }
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 900,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        response = requests.post(
+            DEEPSEEK_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=(5, 20),
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = extract_json_object(content)
+        profile = str(parsed.get("customer_profile", "")).strip()
+        if not profile:
+            profile = build_rule_profile_summary(result)
+        return {
+            "ai_status": "成功",
+            "ai_error": "",
+            "ai_profile": profile,
+            "ai_suggestions": normalize_text(parsed.get("suggestions")),
+            "ai_opportunities": normalize_list(parsed.get("opportunity_points")),
+            "ai_risk_review": normalize_list(parsed.get("risk_review")),
+            "ai_follow_up_questions": normalize_list(parsed.get("follow_up_questions")),
+            "ai_confidence": str(parsed.get("confidence", "中")).strip() or "中",
+        }
+    except Exception as exc:
+        return build_fallback_ai_profile(result, "失败", str(exc))
+
+
+def enrich_customer_profile_with_ai(answers: dict, result: dict) -> dict:
+    ai_result = call_deepseek_customer_profile(answers, result)
+    enriched = result.copy()
+    enriched.update(ai_result)
+    enriched.update(generate_quote_result(answers, enriched))
+    return enriched
+
+
 def build_record_row(answers: dict, result: dict):
     return {
         "submit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -103,6 +401,20 @@ def build_record_row(answers: dict, result: dict):
         "next_actions_json": json.dumps(result.get("next_actions", []), ensure_ascii=False),
         "score_detail_json": json.dumps(result.get("score_detail", {}), ensure_ascii=False),
         "all_answers_json": json.dumps(answers, ensure_ascii=False),
+        "ai_status": result.get("ai_status", ""),
+        "ai_error": result.get("ai_error", ""),
+        "ai_profile": result.get("ai_profile", ""),
+        "ai_suggestions_json": json.dumps(result.get("ai_suggestions", ""), ensure_ascii=False),
+        "ai_opportunities_json": json.dumps(result.get("ai_opportunities", []), ensure_ascii=False),
+        "ai_risk_review_json": json.dumps(result.get("ai_risk_review", []), ensure_ascii=False),
+        "ai_follow_up_questions_json": json.dumps(result.get("ai_follow_up_questions", []), ensure_ascii=False),
+        "ai_confidence": result.get("ai_confidence", ""),
+        "quote_plan": result.get("quote_plan", ""),
+        "quote_range": result.get("quote_range", ""),
+        "customer_tip": result.get("customer_tip", ""),
+        "quote_confidence": result.get("quote_confidence", ""),
+        "manual_review_required": "是" if result.get("manual_review_required") else "否",
+        "quote_basis_json": json.dumps(result.get("quote_basis", []), ensure_ascii=False),
     }
 
 
@@ -129,12 +441,50 @@ def init_database():
                 risk_notes_json TEXT,
                 next_actions_json TEXT,
                 score_detail_json TEXT,
-                all_answers_json TEXT
+                all_answers_json TEXT,
+                ai_status TEXT,
+                ai_error TEXT,
+                ai_profile TEXT,
+                ai_suggestions_json TEXT,
+                ai_opportunities_json TEXT,
+                ai_risk_review_json TEXT,
+                ai_follow_up_questions_json TEXT,
+                ai_confidence TEXT,
+                quote_plan TEXT,
+                quote_range TEXT,
+                customer_tip TEXT,
+                quote_confidence TEXT,
+                manual_review_required TEXT,
+                quote_basis_json TEXT
             )
             """
         )
+        ensure_database_columns(conn)
         conn.commit()
     migrate_csv_to_database()
+
+
+def ensure_database_columns(conn):
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(customer_records)").fetchall()}
+    columns_to_add = {
+        "ai_status": "TEXT",
+        "ai_error": "TEXT",
+        "ai_profile": "TEXT",
+        "ai_suggestions_json": "TEXT",
+        "ai_opportunities_json": "TEXT",
+        "ai_risk_review_json": "TEXT",
+        "ai_follow_up_questions_json": "TEXT",
+        "ai_confidence": "TEXT",
+        "quote_plan": "TEXT",
+        "quote_range": "TEXT",
+        "customer_tip": "TEXT",
+        "quote_confidence": "TEXT",
+        "manual_review_required": "TEXT",
+        "quote_basis_json": "TEXT",
+    }
+    for column, column_type in columns_to_add.items():
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE customer_records ADD COLUMN {column} {column_type}")
 
 
 def migrate_csv_to_database():
@@ -211,153 +561,166 @@ def delete_record_by_id(record_id):
 
 
 def evaluate_customer_profile(answers: dict) -> dict:
+    answers = normalize_answers_for_scoring(answers)
     score_detail = {
-        "组织稳定性": 0,
-        "出行需求明确度": 0,
-        "政策适配度": 0,
-        "渠道合作潜力": 0,
-        "合规与落地条件": 0,
+        "基础信息完整度": 0,
+        "出行规模与场景价值": 0,
+        "行程与航线明确度": 0,
+        "组织协同与落地条件": 0,
+        "合作诉求与材料配合": 0,
     }
     tags = []
     reasons = []
     risk_notes = []
 
     customer_type = answers.get("customer_type", "")
-    org_size = answers.get("org_size", "")
     reach_ability = answers.get("reach_ability", "")
-    platforms = answers.get("platforms", []) or []
     travel_types = answers.get("travel_types", []) or []
     ticketing_scenario = answers.get("ticketing_scenario", "")
     demand_sources = answers.get("demand_sources", []) or []
     fixed_plan = answers.get("fixed_plan", "")
     travel_frequency = answers.get("travel_frequency", "")
     annual_trips = int(answers.get("annual_trips") or 0)
-    route_need = answers.get("route_need", "")
     route_detail = answers.get("route_detail", "")
     group_travel = answers.get("group_travel", "")
     rights_focus = answers.get("rights_focus", []) or []
     compliance_support = answers.get("compliance_support", "")
-    data_reconciliation = answers.get("data_reconciliation", "")
     proof_materials = answers.get("proof_materials", "")
     start_time = answers.get("start_time", "")
+    journeys = answers.get("journeys") or []
+    single_trip_people = int(answers.get("single_trip_people") or 0)
 
-    score_detail["组织稳定性"] += {
-        "50人以下": 3,
-        "50-200人": 6,
-        "200-1000人": 9,
-        "1000人以上": 12,
-    }.get(org_size, 0)
-    if reach_ability == "能够统一通知和组织成员":
-        score_detail["组织稳定性"] += 5
-        tags.append("组织触达能力强")
-        reasons.append("具备统一组织和触达成员的能力。")
-    elif reach_ability == "能够部分触达成员":
-        score_detail["组织稳定性"] += 3
-        tags.append("具备部分触达能力")
-    if [p for p in platforms if p != "暂无"]:
-        score_detail["组织稳定性"] += 3
-        tags.append("已有触达渠道")
-        reasons.append("已具备社群、会员系统或内部平台等成员触达基础。")
-    score_detail["组织稳定性"] = min(20, score_detail["组织稳定性"])
+    if answers.get("contact_name"):
+        score_detail["基础信息完整度"] += 3
+    if answers.get("phone"):
+        score_detail["基础信息完整度"] += 3
+    if answers.get("city"):
+        score_detail["基础信息完整度"] += 2
+    if customer_type:
+        score_detail["基础信息完整度"] += 2
+    if answers.get("organization"):
+        score_detail["基础信息完整度"] += 2
+    if answers.get("role"):
+        score_detail["基础信息完整度"] += 1
+    score_detail["基础信息完整度"] = min(12, score_detail["基础信息完整度"])
+
+    scene_scores = {
+        "公务差旅": 6,
+        "商务拜访": 6,
+        "会议会展": 7,
+        "团队活动": 6,
+        "学术交流": 5,
+        "校友返校 / 校友活动": 5,
+        "文旅出行": 5,
+        "客户答谢 / 员工福利": 4,
+        "个人及家庭出行": 2,
+        "其他": 1,
+    }
+    scene_score = max([scene_scores.get(item, 0) for item in travel_types] or [0])
+    score_detail["出行规模与场景价值"] += scene_score
+    if scene_score >= 5:
+        tags.append("合作场景清晰")
+        reasons.append("客户选择的出行场景具备团队、差旅或活动合作价值。")
+    if single_trip_people >= 200:
+        score_detail["出行规模与场景价值"] += 10
+        tags.append("大规模同行需求")
+    elif single_trip_people >= 50:
+        score_detail["出行规模与场景价值"] += 8
+        tags.append("团队规模较高")
+    elif single_trip_people >= 10:
+        score_detail["出行规模与场景价值"] += 5
+    elif single_trip_people > 0:
+        score_detail["出行规模与场景价值"] += 2
+    if travel_frequency == "每周多次":
+        score_detail["出行规模与场景价值"] += 5
+        tags.append("高频出行")
+    elif travel_frequency == "每月多次":
+        score_detail["出行规模与场景价值"] += 4
+    elif travel_frequency == "每季度多次":
+        score_detail["出行规模与场景价值"] += 3
+    elif travel_frequency == "每年数次":
+        score_detail["出行规模与场景价值"] += 2
+    elif travel_frequency == "单次":
+        score_detail["出行规模与场景价值"] += 1
+    if annual_trips >= 1000:
+        score_detail["出行规模与场景价值"] += 3
+        tags.append("年度出行规模较高")
+    elif annual_trips >= 200:
+        score_detail["出行规模与场景价值"] += 2
+    score_detail["出行规模与场景价值"] = min(25, score_detail["出行规模与场景价值"])
 
     if fixed_plan == "有明确固定行程":
-        score_detail["出行需求明确度"] += 7
+        score_detail["行程与航线明确度"] += 7
         tags.append("行程明确")
-        reasons.append("已体现明确或可验证的出行计划。")
+        reasons.append("客户行程安排较明确，便于客户经理快速核价。")
     elif fixed_plan == "有年度 / 季度计划但日期未定":
-        score_detail["出行需求明确度"] += 5
+        score_detail["行程与航线明确度"] += 5
         tags.append("计划型需求")
     elif fixed_plan == "出行不固定但频率较高":
-        score_detail["出行需求明确度"] += 4
-    if annual_trips >= 5000:
-        score_detail["出行需求明确度"] += 7
-        tags.append("高年度出行规模")
-    elif annual_trips >= 1000:
-        score_detail["出行需求明确度"] += 5
-        tags.append("中高年度出行规模")
-    elif annual_trips >= 200:
-        score_detail["出行需求明确度"] += 3
-    elif annual_trips > 0:
-        score_detail["出行需求明确度"] += 1
-    score_detail["出行需求明确度"] += {
-        "每周多次": 6,
-        "每月多次": 5,
-        "每季度多次": 3,
-        "每年数次": 2,
-        "不确定": 0,
-    }.get(travel_frequency, 0)
-    if route_need == "有，非常明确":
-        score_detail["出行需求明确度"] += 5
-        tags.append("重点航线明确")
-        if route_detail:
-            reasons.append("客户已补充重点航线或方向，有助于进一步核实航线资源与出行计划。")
-    elif route_need == "有大致方向":
-        score_detail["出行需求明确度"] += 3
-        if route_detail:
-            tags.append("航线方向已补充")
-    score_detail["出行需求明确度"] = min(25, score_detail["出行需求明确度"])
-
-    cooperation_travel_types = ["公务差旅", "商务拜访", "会议会展", "团队活动", "学术交流"]
-    matched_travel = [item for item in travel_types if item in cooperation_travel_types]
-    score_detail["政策适配度"] += min(8, len(matched_travel) * 2)
-    if matched_travel:
-        tags.append("合作型出行需求")
-        reasons.append("出行场景与渠道合作、团队服务或差旅支持有较高关联。")
-    cooperation_rights = ["票价优惠", "改退签灵活性", "团队票支持", "数据统计 / 对账支持", "专属客户经理"]
-    matched_rights = [item for item in rights_focus if item in cooperation_rights]
-    score_detail["政策适配度"] += min(9, len(matched_rights) * 2)
-    if matched_rights:
-        tags.append("合作权益诉求明确")
-    if data_reconciliation in ["是，需要定期统计", "偶尔需要"]:
-        score_detail["政策适配度"] += 3
-        tags.append("需要数据支持")
-    if ticketing_scenario in ["公商务出票", "会议会展出票", "客户需求代订 / 渠道出票"]:
-        score_detail["政策适配度"] += 3
-        tags.append("出票场景清晰")
-        reasons.append("已明确出票或渠道承接场景，便于进一步匹配合作支持方式。")
-    elif ticketing_scenario in ["旅游团队出票", "员工福利 / 客户答谢出行"]:
-        score_detail["政策适配度"] += 2
-        tags.append("场景型出行需求")
-    if proof_materials in ["可以提供合同 / 邀请函 / 会议通知等材料", "可以提供组织证明或成员证明"]:
-        score_detail["政策适配度"] += 5
-        tags.append("材料基础较好")
-        reasons.append("具备进一步核实合作场景的证明材料基础。")
-    elif proof_materials == "视情况而定":
-        score_detail["政策适配度"] += 2
-    score_detail["政策适配度"] = min(25, score_detail["政策适配度"])
-
-    matched_platforms = [item for item in platforms if item in ["会员系统", "小程序 / App", "微信群 / 社群", "企业内网 / OA", "校友平台"]]
-    score_detail["渠道合作潜力"] += min(8, len(matched_platforms) * 2)
-    if reach_ability == "能够统一通知和组织成员":
-        score_detail["渠道合作潜力"] += 6
-    elif reach_ability == "能够部分触达成员":
-        score_detail["渠道合作潜力"] += 4
-    if "品牌联合推广" in rights_focus:
-        score_detail["渠道合作潜力"] += 4
-        tags.append("品牌共建意愿")
-    if "专属活动页面或入口" in rights_focus:
-        score_detail["渠道合作潜力"] += 2
-        tags.append("专属入口诉求")
-    if any(item in demand_sources for item in ["会员 / 社群客户需求", "长期渠道销售需求", "旅行 / 活动团队需求"]):
-        score_detail["渠道合作潜力"] += 3
-        tags.append("需求来源可运营")
-    score_detail["渠道合作潜力"] = min(20, score_detail["渠道合作潜力"])
-
-    if compliance_support == "是，需要":
-        score_detail["合规与落地条件"] += 3
-        tags.append("关注合规支持")
-    elif compliance_support == "不确定":
-        score_detail["合规与落地条件"] += 1
-    if proof_materials in ["可以提供合同 / 邀请函 / 会议通知等材料", "可以提供组织证明或成员证明"]:
-        score_detail["合规与落地条件"] += 4
-    elif proof_materials == "视情况而定":
-        score_detail["合规与落地条件"] += 2
-    if start_time in ["立即启动", "1个月内", "3个月内"]:
-        score_detail["合规与落地条件"] += 3
-        tags.append("启动时间明确")
+        score_detail["行程与航线明确度"] += 4
+    if route_detail:
+        score_detail["行程与航线明确度"] += 6
+        tags.append("航线信息已补充")
+        reasons.append("客户已填写出发城市和到达城市，可进入航线资源匹配。")
+    if journeys:
+        score_detail["行程与航线明确度"] += min(3, len(journeys))
+    if any(item.get("time_preferences") for item in journeys):
+        score_detail["行程与航线明确度"] += 2
+        tags.append("时间偏好已补充")
+    if start_time in ["立即启动", "1个月内"]:
+        score_detail["行程与航线明确度"] += 5
+        tags.append("启动紧迫")
+    elif start_time == "3个月内":
+        score_detail["行程与航线明确度"] += 4
     elif start_time == "半年内":
-        score_detail["合规与落地条件"] += 1
-    score_detail["合规与落地条件"] = min(10, score_detail["合规与落地条件"])
+        score_detail["行程与航线明确度"] += 2
+    score_detail["行程与航线明确度"] = min(22, score_detail["行程与航线明确度"])
+
+    if reach_ability == "能够统一通知和组织成员":
+        score_detail["组织协同与落地条件"] += 8
+        tags.append("组织能力强")
+        reasons.append("客户具备统一通知和组织同行人员的能力。")
+    elif reach_ability == "能够部分触达成员":
+        score_detail["组织协同与落地条件"] += 5
+        tags.append("具备部分组织能力")
+    elif reach_ability == "主要依赖个人自愿参与":
+        score_detail["组织协同与落地条件"] += 2
+    if group_travel == "经常需要":
+        score_detail["组织协同与落地条件"] += 5
+        tags.append("需要统一往返")
+    elif group_travel == "偶尔需要":
+        score_detail["组织协同与落地条件"] += 3
+    elif group_travel == "基本不需要":
+        score_detail["组织协同与落地条件"] += 1
+    if len(journeys) >= 2:
+        score_detail["组织协同与落地条件"] += 2
+        tags.append("多行程需求")
+    score_detail["组织协同与落地条件"] = min(16, score_detail["组织协同与落地条件"])
+
+    if rights_focus:
+        score_detail["合作诉求与材料配合"] += min(8, len(rights_focus) * 2)
+        tags.append("支持项诉求明确")
+    if "团队票支持" in rights_focus:
+        score_detail["合作诉求与材料配合"] += 3
+    if "票价优惠" in rights_focus:
+        score_detail["合作诉求与材料配合"] += 2
+    if "品牌联合推广" in rights_focus or "专属活动页面或入口" in rights_focus:
+        score_detail["合作诉求与材料配合"] += 2
+        tags.append("存在合作共建诉求")
+    if compliance_support in ["涉及，需要", "是，需要"]:
+        score_detail["合作诉求与材料配合"] += 4
+        tags.append("涉及合规需求")
+    elif compliance_support == "不确定":
+        score_detail["合作诉求与材料配合"] += 1
+    if proof_materials in ["可以提供合同 / 邀请函 / 会议通知等材料", "可以提供组织证明或成员证明", "可以提供"]:
+        score_detail["合作诉求与材料配合"] += 5
+        tags.append("材料可配合")
+        reasons.append("客户表示可配合提供后续核实材料。")
+    elif proof_materials == "视情况而定":
+        score_detail["合作诉求与材料配合"] += 2
+    if answers.get("cooperation_goal"):
+        score_detail["合作诉求与材料配合"] += 2
+    score_detail["合作诉求与材料配合"] = min(25, score_detail["合作诉求与材料配合"])
 
     score = int(sum(score_detail.values()))
     if score >= 80:
@@ -369,26 +732,28 @@ def evaluate_customer_profile(answers: dict) -> dict:
     else:
         match_level = "D级，普惠权益引导客户"
 
-    can_reach = reach_ability in ["能够统一通知和组织成员", "能够部分触达成员"]
-    has_channel = bool(set(platforms) & {"会员系统", "小程序 / App", "微信群 / 社群"})
-    if customer_type == "政府 / 事业单位" and compliance_support == "是，需要":
+    if customer_type == "政府 / 事业单位" and compliance_support in ["是，需要", "涉及，需要"]:
         customer_segment = "公务合规型客户"
         recommended_policy = "公务出行合规支持方案"
     elif customer_type == "企业客户" and ("公务差旅" in travel_types or "商务拜访" in travel_types or ticketing_scenario == "公商务出票"):
         customer_segment = "企业差旅型客户"
         recommended_policy = "企业差旅合作方案"
-    elif customer_type == "高校 / 校友会" and ("学术交流" in travel_types or "校友返校 / 校友活动" in travel_types):
+    elif customer_type == "高校 / 校友会" and ("学术交流" in travel_types or "校友返校 / 校友活动" in travel_types or "校友活动" in travel_types):
         customer_segment = "高校校友合作客户"
         recommended_policy = "高校 / 校友专项出行方案"
-    elif customer_type == "文旅 / 会展 / 活动合作方" and (group_travel in ["经常涉及", "偶尔涉及"] or ticketing_scenario in ["旅游团队出票", "会议会展出票"]):
+    elif (
+        customer_type == "文旅 / 会展 / 活动合作方"
+        or ticketing_scenario in ["旅游团队出票", "会议会展出票"]
+        or "会议会展" in travel_types
+    ) and (group_travel in ["经常涉及", "偶尔涉及", "经常需要", "偶尔需要"] or ticketing_scenario in ["旅游团队出票", "会议会展出票"]):
         customer_segment = "会展文旅团队客户"
         recommended_policy = "会展团队出行支持方案"
     elif ticketing_scenario == "客户需求代订 / 渠道出票" or "长期渠道销售需求" in demand_sources:
         customer_segment = "渠道运营型客户"
         recommended_policy = "渠道会员权益共建方案"
-    elif has_channel and can_reach:
-        customer_segment = "渠道运营型客户"
-        recommended_policy = "渠道会员权益共建方案"
+    elif single_trip_people >= 50 and "团队票支持" in rights_focus:
+        customer_segment = "团队报价客户"
+        recommended_policy = "团队出行报价方案"
     else:
         customer_segment = "普通潜力客户"
         recommended_policy = "普通会员权益引导方案"
@@ -399,12 +764,10 @@ def evaluate_customer_profile(answers: dict) -> dict:
         risk_notes.append("暂未体现统一触达渠道，建议核实客户组织动员能力。")
     if proof_materials in ["暂时无法提供", ""]:
         risk_notes.append("暂无法提供证明材料，建议进入人工复核。")
-    if route_need in ["有，非常明确", "有大致方向"] and not route_detail:
-        risk_notes.append("已选择存在重点航线需求，但尚未填写具体航线或方向，建议进一步补充。")
+    if not route_detail:
+        risk_notes.append("尚未填写完整出发城市或到达城市，建议补充航线后再精确报价。")
     if not ticketing_scenario or ticketing_scenario == "其他":
         risk_notes.append("出票或合作场景仍需进一步明确，建议人工确认客户真实需求类型。")
-    if not demand_sources:
-        risk_notes.append("需求来源暂未明确，建议补充客户需求来自内部成员、社群渠道还是外部客户。")
     if annual_trips < 100:
         risk_notes.append("年度预估出行人次较低，建议先按普通会员权益培育。")
 
@@ -516,8 +879,8 @@ def render_top_bar():
 
 
 def render_progress():
-    st.progress(st.session_state.step / 6)
-    st.markdown(f"**第 {st.session_state.step} 步 / 共 6 步**")
+    st.progress(st.session_state.step / 3)
+    st.markdown(f"**第 {st.session_state.step} 步 / 共 3 步**")
 
 
 def set_widget_default(key, default):
@@ -527,118 +890,145 @@ def set_widget_default(key, default):
 
 def collect_answers(keys):
     for key in keys:
-        st.session_state.answers[key] = st.session_state.get(key)
+        if key == "journeys":
+            st.session_state.answers[key] = collect_journeys()
+        else:
+            st.session_state.answers[key] = st.session_state.get(key)
 
 
 def list_to_text(value):
-    return "，".join(value) if isinstance(value, list) else (value if value is not None else "")
+    if isinstance(value, list):
+        if value and isinstance(value[0], dict):
+            return "；".join(
+                f"{idx + 1}. {item.get('departure_city', '')} 至 {item.get('arrival_cities', '')}，{item.get('travel_frequency', '')}，{item.get('group_travel', '')}"
+                for idx, item in enumerate(value)
+            )
+        return "，".join(value)
+    return value if value is not None else ""
+
+
+def collect_journeys():
+    journeys = []
+    count = int(st.session_state.get("journey_count", 1) or 1)
+    for idx in range(count):
+        journey = {
+            "time_preferences": st.session_state.get(f"journey_{idx}_time_preferences", []),
+            "departure_city": st.session_state.get(f"journey_{idx}_departure_city", ""),
+            "arrival_cities": st.session_state.get(f"journey_{idx}_arrival_cities", ""),
+            "travel_frequency": st.session_state.get(f"journey_{idx}_travel_frequency", ""),
+            "group_travel": st.session_state.get(f"journey_{idx}_group_travel", ""),
+        }
+        if any(journey.values()):
+            journeys.append(journey)
+    return journeys
+
+
+def remove_journey(remove_idx: int):
+    count = int(st.session_state.get("journey_count", 1) or 1)
+    fields = ["time_preferences", "departure_city", "arrival_cities", "travel_frequency", "group_travel"]
+    snapshots = []
+    for idx in range(count):
+        snapshots.append({field: st.session_state.get(f"journey_{idx}_{field}", [] if field == "time_preferences" else "") for field in fields})
+    snapshots.pop(remove_idx)
+    for idx, data in enumerate(snapshots):
+        for field, value in data.items():
+            st.session_state[f"journey_{idx}_{field}"] = value
+    last_idx = count - 1
+    for field in fields:
+        st.session_state.pop(f"journey_{last_idx}_{field}", None)
+    st.session_state.journey_count = max(1, count - 1)
+
+
+def apply_pending_journey_removal():
+    remove_idx = st.session_state.get("pending_remove_journey")
+    if remove_idx is None:
+        return
+    st.session_state.pending_remove_journey = None
+    remove_journey(int(remove_idx))
 
 
 def answers_dataframe(answers: dict):
     labels = {
         "contact_name": "联系人姓名", "phone": "联系电话", "organization": "所属单位 / 组织名称",
         "role": "职务 / 角色", "city": "所在城市", "customer_type": "客户类型",
-        "org_size": "组织人数规模", "existing_channel": "是否已有固定合作渠道",
-        "reach_ability": "是否具备统一组织 / 触达成员能力", "platforms": "专属入口、会员体系、社群或内部平台",
-        "travel_types": "主要出行类型", "ticketing_scenario": "主要出票 / 合作场景",
-        "demand_sources": "需求来源", "fixed_plan": "是否有固定或可预测行程",
-        "travel_frequency": "预计出行频率", "single_trip_people": "预计单次同行人数",
-        "annual_trips": "年度预估出行人次", "departure_city": "常用出发城市",
-        "arrival_cities": "常用到达城市", "route_need": "是否有重点航线需求",
-        "route_detail": "重点航线或方向",
-        "time_preferences": "出行时间偏好", "group_travel": "是否涉及团队集中出行",
-        "rights_focus": "最关注的合作权益", "compliance_support": "是否需要公务类合规支持",
-        "data_reconciliation": "是否需要客户侧数据回收 / 对账", "proof_materials": "是否愿意配合提供证明材料",
-        "cooperation_goal": "合作目标", "start_time": "预计启动时间", "remarks": "备注信息",
+        "travel_scene": "本次出行主要场景", "single_trip_people": "本次预计同行人数",
+        "companion_count_range": "同行人数区间", "fixed_plan": "行程确定度",
+        "reach_ability": "是否可统一组织", "journeys": "行程信息",
+        "start_time": "希望开始购票时间", "rights_focus": "最关注的支持项",
+        "compliance_support": "是否涉及报销、审批或合规要求", "compliance_detail": "合规补充说明",
+        "proof_materials": "是否方便提供相关材料",
+        "cooperation_goal": "希望先解决的问题", "remarks": "补充信息",
     }
     return pd.DataFrame([{"字段": label, "内容": list_to_text(answers.get(key, ""))} for key, label in labels.items()])
 
 
 def render_step_1_basic_info():
-    st.subheader("基础身份信息")
-    defaults = {"contact_name": "", "phone": "", "organization": "", "role": "", "city": "", "customer_type": "企业客户"}
+    st.subheader("填写基础信息")
+    st.caption("快速完成客户身份确认。")
+    defaults = {"contact_name": "", "phone": "", "organization": "", "role": "联系人", "city": "", "customer_type": "企业客户"}
     for key, default in defaults.items():
         set_widget_default(key, default)
-    st.text_input("联系人姓名 *", key="contact_name")
-    st.text_input("联系电话 *", key="phone")
-    st.text_input("所属单位 / 组织名称 *", key="organization")
-    st.text_input("职务 / 角色", key="role")
-    st.text_input("所在城市", key="city")
-    st.radio("客户类型", ["企业客户", "政府 / 事业单位", "高校 / 校友会", "协会 / 商会 / 社团", "文旅 / 会展 / 活动合作方", "客户端渠道客户", "个人高频出行客户", "其他"], key="customer_type")
+    st.text_input("您的姓名 *", key="contact_name")
+    st.text_input("联系方式（手机号码） *", placeholder="用于报价确认及后续沟通", key="phone")
+    st.text_input("您所在的单位、组织或团队名称", key="organization")
+    role_choice = st.radio("您在本次出行咨询中的身份", ["组织人", "采购人", "负责人", "联系人", "其他"], key="role")
+    if role_choice == "其他":
+        st.text_input("请填写您的身份", key="role_other")
+    st.text_input("您所在的城市 *", key="city")
+    st.radio("您所在的单位、组织或团队类型 *", ["企业客户", "政府或事业单位", "高校或校友会", "协会、商会或社团", "文旅、会展或活动合作方", "其他"], key="customer_type")
 
 
-def render_step_2_org_profile():
-    st.subheader("组织属性与合作基础")
-    defaults = {"org_size": "50-200人", "existing_channel": "否，暂无固定航司合作", "reach_ability": "能够部分触达成员", "platforms": []}
+def render_step_2_travel_route_time():
+    st.subheader("填写出行需求、航线与时间")
+    st.caption("快速识别客户需求与规模，用于后续报价策略判断。")
+    apply_pending_journey_removal()
+    defaults = {"travel_scene": "公务差旅", "companion_count_range": "10-49人", "single_trip_people": 10, "fixed_plan": "有大致计划但日期未定", "reach_ability": "能够部分触达成员", "journey_count": 1, "start_time": "3个月内"}
     for key, default in defaults.items():
         set_widget_default(key, default)
-    st.radio("组织人数规模", ["50人以下", "50-200人", "200-1000人", "1000人以上"], key="org_size")
-    st.radio("是否已有固定合作渠道", ["是，已有南航相关合作", "是，但主要与其他航司合作", "否，暂无固定航司合作", "不确定"], key="existing_channel")
-    st.radio("是否具备统一组织 / 触达成员能力", ["能够统一通知和组织成员", "能够部分触达成员", "主要依赖个人自愿参与", "暂不具备"], key="reach_ability")
-    st.multiselect("是否有专属入口、会员体系、社群或内部平台", ["企业内网 / OA", "微信群 / 社群", "会员系统", "小程序 / App", "校友平台", "暂无"], key="platforms")
+    st.radio("本次出行主要属于哪种场景 *", ["公务差旅", "商务拜访", "会议会展", "团队活动", "学术交流", "校友活动", "文旅出行", "员工福利或客户答谢", "个人及家庭出行", "其他"], key="travel_scene")
+    st.radio("本次预计有多少人同行 *", ["1-9人", "10-49人", "50-199人", "200人及以上", "暂不确定"], key="companion_count_range")
+    st.number_input("如方便，请填写预计具体人数", min_value=1, max_value=100000, step=1, key="single_trip_people")
+    st.radio("您这次的行程安排是否已经比较明确 *", ["已明确固定行程", "有大致计划但日期未定", "出行频率较高但不固定", "暂无明确计划"], key="fixed_plan")
+    st.radio("是否可统一组织或通知同行人员 *", ["能够统一通知和组织成员", "能够部分触达成员", "主要依赖个人自愿参与", "暂不具备"], key="reach_ability")
+
+    st.markdown("#### 请添加您的行程")
+    count = int(st.session_state.get("journey_count", 1) or 1)
+    for idx in range(count):
+        with st.expander(f"行程 {idx + 1}", expanded=True):
+            if count > 1 and idx > 0:
+                if st.button("删除该行程", key=f"remove_journey_{idx}"):
+                    st.session_state.pending_remove_journey = idx
+                    st.rerun()
+            if st.session_state.fixed_plan != "已明确固定行程":
+                set_widget_default(f"journey_{idx}_time_preferences", [])
+                st.multiselect("您更倾向于在哪些时间段出行", ["工作日", "周末", "节假日", "寒暑假", "会展或活动期间", "无固定偏好"], key=f"journey_{idx}_time_preferences")
+            set_widget_default(f"journey_{idx}_departure_city", "")
+            set_widget_default(f"journey_{idx}_arrival_cities", "")
+            set_widget_default(f"journey_{idx}_travel_frequency", "单次")
+            set_widget_default(f"journey_{idx}_group_travel", "偶尔需要")
+            st.text_input("您从哪个城市出发 *", key=f"journey_{idx}_departure_city")
+            st.text_input("您前往哪些城市 *", placeholder="可填写多个城市，用逗号分隔", key=f"journey_{idx}_arrival_cities")
+            st.radio("类似出行需求的频率大约是", ["单次", "每周多次", "每月多次", "每季度多次", "每年数次", "不确定"], key=f"journey_{idx}_travel_frequency")
+            st.radio("本次是否需要统一出发、统一返回", ["经常需要", "偶尔需要", "基本不需要", "不确定"], key=f"journey_{idx}_group_travel")
+    if st.button("+ 继续添加更多行程", key="add_journey"):
+        st.session_state.journey_count = count + 1
+        st.rerun()
+    st.radio("您希望什么时候开始购票", ["立即启动", "1个月内", "3个月内", "半年内", "暂不确定"], key="start_time")
 
 
-def render_step_3_travel_needs():
-    st.subheader("出行需求")
-    defaults = {
-        "travel_types": [],
-        "ticketing_scenario": "公商务出票",
-        "demand_sources": [],
-        "fixed_plan": "有年度 / 季度计划但日期未定",
-        "travel_frequency": "每季度多次",
-        "single_trip_people": 1,
-        "annual_trips": 0,
-    }
+def render_step_3_cooperation_needs():
+    st.subheader("填写合作诉求")
+    st.caption("辅助生成报价政策与客户画像。")
+    defaults = {"rights_focus": [], "compliance_support": "不确定", "compliance_detail": "", "proof_materials": "视情况而定", "cooperation_goal": "", "remarks": "", "analysis_agreement": False}
     for key, default in defaults.items():
         set_widget_default(key, default)
-    st.multiselect("主要出行类型", ["公务差旅", "商务拜访", "会议会展", "团队活动", "学术交流", "校友返校 / 校友活动", "文旅出行", "客户答谢 / 员工福利", "个人及家庭出行"], key="travel_types")
-    st.radio("主要出票 / 合作场景", ["公商务出票", "旅游团队出票", "会议会展出票", "客户需求代订 / 渠道出票", "员工福利 / 客户答谢出行", "个人会员出行", "其他"], key="ticketing_scenario")
-    st.multiselect("需求来源", ["企业员工差旅需求", "政府 / 事业单位公务需求", "会员 / 社群客户需求", "旅行 / 活动团队需求", "会议会展参会需求", "临时客户咨询需求", "长期渠道销售需求", "个人及家庭出行需求"], key="demand_sources")
-    st.radio("是否有固定或可预测行程", ["有明确固定行程", "有年度 / 季度计划但日期未定", "出行不固定但频率较高", "暂无明确计划"], key="fixed_plan")
-    st.radio("预计出行频率", ["每周多次", "每月多次", "每季度多次", "每年数次", "不确定"], key="travel_frequency")
-    st.slider("预计单次同行人数", 1, 500, key="single_trip_people")
-    st.number_input("年度预估出行人次", min_value=0, max_value=100000, step=10, key="annual_trips")
-
-
-def render_step_4_route_time():
-    st.subheader("航线与时间需求")
-    defaults = {"departure_city": "", "arrival_cities": "", "route_need": "有大致方向", "route_detail": "", "time_preferences": [], "group_travel": "偶尔涉及"}
-    for key, default in defaults.items():
-        set_widget_default(key, default)
-    st.text_input("常用出发城市", key="departure_city")
-    st.text_input("常用到达城市，可输入多个，用逗号分隔", key="arrival_cities")
-    st.radio("是否有重点航线需求", ["有，非常明确", "有大致方向", "暂无明确航线"], key="route_need")
-    if st.session_state.route_need in ["有，非常明确", "有大致方向"]:
-        st.text_input(
-            "请填写重点航线或方向",
-            placeholder="例如：广州-北京、深圳-上海，或华南至华东、广州出发国内重点城市等",
-            key="route_detail",
-        )
-    else:
-        st.session_state.route_detail = ""
-    st.multiselect("出行时间偏好", ["工作日", "周末", "节假日", "寒暑假", "会展 / 活动期间", "无固定偏好"], key="time_preferences")
-    st.radio("是否涉及团队集中出行", ["经常涉及", "偶尔涉及", "基本不涉及", "不确定"], key="group_travel")
-
-
-def render_step_5_policy_needs():
-    st.subheader("政策需求与权益偏好")
-    defaults = {"rights_focus": [], "compliance_support": "不确定", "data_reconciliation": "偶尔需要", "proof_materials": "视情况而定"}
-    for key, default in defaults.items():
-        set_widget_default(key, default)
-    st.multiselect("最关注的合作权益", ["票价优惠", "改退签灵活性", "行李权益", "贵宾服务", "团队票支持", "专属客户经理", "数据统计 / 对账支持", "专属活动页面或入口", "品牌联合推广"], key="rights_focus")
-    st.radio("是否需要公务类合规支持", ["是，需要", "否，不需要", "不确定"], key="compliance_support")
-    st.radio("是否需要客户侧数据回收 / 对账", ["是，需要定期统计", "偶尔需要", "不需要"], key="data_reconciliation")
-    st.radio("是否愿意配合提供证明材料", ["可以提供合同 / 邀请函 / 会议通知等材料", "可以提供组织证明或成员证明", "暂时无法提供", "视情况而定"], key="proof_materials")
-
-
-def render_step_6_confirmation():
-    st.subheader("补充说明与确认")
-    defaults = {"cooperation_goal": "", "start_time": "暂不确定", "remarks": "", "analysis_agreement": False}
-    for key, default in defaults.items():
-        set_widget_default(key, default)
-    st.text_area("合作目标", placeholder="例如：希望解决什么问题、希望达成什么合作效果", key="cooperation_goal")
-    st.radio("预计启动时间", ["立即启动", "1个月内", "3个月内", "半年内", "暂不确定"], key="start_time")
-    st.text_area("备注信息", key="remarks")
+    st.multiselect("您最关注哪些支持项", ["票价优惠", "行李权益", "贵宾服务", "团队票支持", "专属活动页或入口", "品牌联合推广"], key="rights_focus")
+    st.radio("本次是否涉及报销、审批或合规要求", ["涉及，需要", "不涉及", "不确定"], key="compliance_support")
+    if st.session_state.compliance_support in ["涉及，需要", "不确定"]:
+        st.text_input("如方便，请补充说明", placeholder="例如：公务卡报销、对公结算、审批材料等", key="compliance_detail")
+    st.radio("如后续需要核实信息，您是否方便提供相关材料", ["可以提供", "暂时无法提供", "视情况而定"], key="proof_materials")
+    st.text_area("您这次最希望先解决什么问题", max_chars=200, key="cooperation_goal")
+    st.text_area("还有哪些补充信息可以提前告诉我们", max_chars=300, key="remarks")
     st.checkbox("我同意将以上信息用于合作需求分析 *", key="analysis_agreement")
 
 
@@ -647,7 +1037,7 @@ def render_home_page():
     st.markdown('<div class="hero-subtitle">请选择访问身份，进入对应功能页面</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown('<div class="card"><h3 style="color:#003399;margin-top:0;">客户填报入口</h3><p class="secondary-note">通过几个问题生成您的渠道合作画像与适配方案。</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="card"><h3 style="color:#003399;margin-top:0;">客户填报入口</h3><p class="secondary-note">填写您的出行需求后，我们将为您匹配对应合作方案，并提供初步报价参考。</p></div>', unsafe_allow_html=True)
         if st.button("我是合作客户，开始填写需求", key="home_customer"):
             reset_form()
             st.rerun()
@@ -661,19 +1051,16 @@ def render_home_page():
 
 def render_customer_page():
     render_top_bar()
-    st.markdown('<div class="hero-title">合作客户需求测评</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-subtitle">完成几个问题，生成您的渠道合作画像与适配方案</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-title">客户需求收集问卷</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-subtitle">填写您的出行需求后，我们将为您匹配对应合作方案，并提供初步报价参考。</div>', unsafe_allow_html=True)
     render_progress()
     step = st.session_state.step
     step_keys = {
         1: ["contact_name", "phone", "organization", "role", "city", "customer_type"],
-        2: ["org_size", "existing_channel", "reach_ability", "platforms"],
-        3: ["travel_types", "ticketing_scenario", "demand_sources", "fixed_plan", "travel_frequency", "single_trip_people", "annual_trips"],
-        4: ["departure_city", "arrival_cities", "route_need", "route_detail", "time_preferences", "group_travel"],
-        5: ["rights_focus", "compliance_support", "data_reconciliation", "proof_materials"],
-        6: ["cooperation_goal", "start_time", "remarks", "analysis_agreement"],
+        2: ["travel_scene", "companion_count_range", "single_trip_people", "fixed_plan", "reach_ability", "journeys", "start_time"],
+        3: ["rights_focus", "compliance_support", "compliance_detail", "proof_materials", "cooperation_goal", "remarks", "analysis_agreement"],
     }
-    [render_step_1_basic_info, render_step_2_org_profile, render_step_3_travel_needs, render_step_4_route_time, render_step_5_policy_needs, render_step_6_confirmation][step - 1]()
+    [render_step_1_basic_info, render_step_2_travel_route_time, render_step_3_cooperation_needs][step - 1]()
     back_col, next_col = st.columns(2)
     with back_col:
         if st.button("上一步", key=f"back_{step}", disabled=step == 1):
@@ -681,21 +1068,27 @@ def render_customer_page():
             go_back()
             st.rerun()
     with next_col:
-        if step < 6:
+        if step < 3:
             if st.button("下一步", key=f"next_{step}"):
                 collect_answers(step_keys[step])
-                if step == 1 and (not st.session_state.answers.get("contact_name") or not st.session_state.answers.get("phone") or not st.session_state.answers.get("organization")):
-                    st.warning("请填写联系人姓名、联系电话和所属单位 / 组织名称。")
+                if step == 1 and (not st.session_state.answers.get("contact_name") or not st.session_state.answers.get("phone") or not st.session_state.answers.get("city") or not st.session_state.answers.get("customer_type")):
+                    st.warning("请填写姓名、联系方式、所在城市和单位/组织类型。")
+                    return
+                if step == 2 and not st.session_state.answers.get("journeys"):
+                    st.warning("请至少填写一条行程信息。")
                     return
                 go_next()
                 st.rerun()
-        elif st.button("提交并生成画像", key="submit_form"):
+        elif st.button("获取报价参考 / 提交需求 / 获取合作方案", key="submit_form"):
             collect_answers(step_keys[step])
             if not st.session_state.answers.get("analysis_agreement"):
                 st.warning("请先勾选同意用于合作需求分析。")
                 return
-            st.session_state.result = evaluate_customer_profile(st.session_state.answers)
-            st.session_state.saved = False
+            rule_result = evaluate_customer_profile(st.session_state.answers)
+            with st.spinner("正在调用 DeepSeek 生成客户画像与跟进建议..."):
+                st.session_state.result = enrich_customer_profile_with_ai(st.session_state.answers, rule_result)
+            save_record(st.session_state.answers, st.session_state.result)
+            st.session_state.saved = True
             st.session_state.page = "result"
             st.rerun()
 
@@ -703,25 +1096,33 @@ def render_customer_page():
 def render_result_page():
     render_top_bar()
     answers = st.session_state.answers
-    result = st.session_state.result or evaluate_customer_profile(answers)
-    st.success("提交信息已生成，请确认后提交本次记录。")
-    st.markdown('<div class="hero-title">请确认您的填报信息</div>', unsafe_allow_html=True)
-    submit_left, submit_mid, submit_right = st.columns([3, 1.2, 3])
-    with submit_mid:
-        with st.container(key="submit_record_action"):
-            if st.button("提交本次记录", key="save_record"):
-                if st.session_state.saved:
-                    st.info("本次记录已保存，无需重复提交。")
-                else:
-                    save_record(answers, result)
-                    st.session_state.saved = True
-                    st.success("已保存")
-    st.subheader("答案汇总")
+    result = st.session_state.result or enrich_customer_profile_with_ai(answers, evaluate_customer_profile(answers))
+    if not result.get("quote_plan"):
+        result.update(generate_quote_result(answers, result))
+        st.session_state.result = result
+    st.success("您的需求已提交成功；我们将根据您填写的信息，为您匹配对应合作方案及报价参考；后续将由客户经理与您联系确认。")
+    st.markdown('<div class="hero-title">您的报价参考</div>', unsafe_allow_html=True)
+    quote_cols = st.columns(3)
+    quote_values = [
+        ("报价方案", result.get("quote_plan", "待客户经理确认")),
+        ("大致报价区间", result.get("quote_range", "待确认")),
+        ("结果置信度", result.get("quote_confidence", "中")),
+    ]
+    for col, (label, value) in zip(quote_cols, quote_values):
+        with col:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div></div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.write(result.get("customer_tip", "客户经理将结合实际航班、舱位、人数和出票时间，为您提供进一步报价参考。"))
+    st.info("以上为初步报价参考，最终价格和权益以客户经理确认的航班、舱位、出票时间及合作材料为准。")
+    st.subheader("请确认您的填报信息")
     st.dataframe(answers_dataframe(answers), use_container_width=True, hide_index=True)
     payload = {"answers": answers, "result": result, "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.download_button("导出 JSON", json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), file_name=f"customer_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", mime="application/json", key="download_result_json")
+        if st.button("补充信息并重新生成", key="result_edit"):
+            st.session_state.page = "customer_form"
+            st.session_state.step = 3
+            st.rerun()
     with col2:
         if st.button("重新填写", key="result_restart"):
             reset_form()
@@ -813,39 +1214,93 @@ def render_record_detail(record):
     risk_notes = parse_json_field(record.get("risk_notes_json", ""), [])
     next_actions = parse_json_field(record.get("next_actions_json", ""), [])
     reason = parse_json_field(record.get("reason_json", ""), [])
+    ai_suggestions = parse_json_field(record.get("ai_suggestions_json", ""), "")
+    ai_opportunities = parse_json_field(record.get("ai_opportunities_json", ""), [])
+    ai_risk_review = parse_json_field(record.get("ai_risk_review_json", ""), [])
+    ai_follow_up_questions = parse_json_field(record.get("ai_follow_up_questions_json", ""), [])
+    quote_basis = parse_json_field(record.get("quote_basis_json", ""), [])
+    manual_review_required = record.get("manual_review_required", "")
 
-    with st.expander("客户完整答案", expanded=True):
+    overview_cols = st.columns(4)
+    overview_values = [
+        ("报价方案", record.get("quote_plan", "") or record.get("recommended_policy", "")),
+        ("报价区间", record.get("quote_range", "") or "待确认"),
+        ("置信度", record.get("quote_confidence", "") or record.get("ai_confidence", "")),
+        ("人工复核", manual_review_required or ("是" if risk_notes else "否")),
+    ]
+    for col, (label, value) in zip(overview_cols, overview_values):
+        with col:
+            st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value or "-"}</div></div>', unsafe_allow_html=True)
+
+    with st.expander("客户基础信息", expanded=True):
         st.dataframe(answers_dataframe(all_answers), use_container_width=True, hide_index=True)
 
-    with st.expander("评分明细"):
+    with st.expander("客户画像", expanded=True):
+        ai_status = record.get("ai_status", "")
+        ai_confidence = record.get("ai_confidence", "")
+        ai_error = record.get("ai_error", "")
+        if ai_status:
+            st.caption(f"AI 状态：{ai_status} | 置信度：{ai_confidence or '-'}")
+        if ai_error:
+            st.warning(ai_error)
+        st.write(record.get("ai_profile", "") or "暂无 DeepSeek 画像。")
+
+    with st.expander("报价建议", expanded=True):
+        st.write(record.get("customer_tip", "") or "暂无客户侧报价提示。")
+        if ai_suggestions:
+            st.markdown("**渠道经理建议：**")
+            st.write(normalize_text(ai_suggestions))
+        if quote_basis:
+            st.markdown("**报价依据：**")
+            for item in quote_basis:
+                st.write(f"- {item}")
+
+    with st.expander("规则命中详情"):
+        st.write(f"**客户分层：** {record.get('customer_segment', '')}")
+        st.write(f"**匹配等级：** {record.get('match_level', '')}")
+        st.write(f"**综合评分：** {record.get('score', '')}")
         if score_detail:
             score_df = pd.DataFrame(
                 [{"评分维度": key, "得分": value} for key, value in score_detail.items()]
             )
             st.dataframe(score_df, use_container_width=True, hide_index=True)
-        else:
-            st.write("暂无评分明细。")
-
-    with st.expander("客户标签"):
-        st.write("，".join(tags) if tags else "暂无")
-
-    with st.expander("待核实事项"):
-        if risk_notes:
-            for item in risk_notes:
+        if tags:
+            st.write(f"**命中标签：** {'，'.join(tags)}")
+        if reason:
+            st.markdown("**命中原因：**")
+            for item in reason:
                 st.write(f"- {item}")
-        else:
-            st.write("暂无明显风险。")
 
-    with st.expander("后续动作"):
-        if next_actions:
-            for item in next_actions:
+    with st.expander("合作机会点"):
+        if ai_opportunities:
+            for item in ai_opportunities:
                 st.write(f"- {item}")
         else:
             st.write("暂无")
 
-    with st.expander("匹配原因"):
-        if reason:
-            for item in reason:
+    with st.expander("风险提示与人工复核", expanded=manual_review_required == "是"):
+        st.write(f"**是否建议人工复核：** {manual_review_required or ('是' if risk_notes else '否')}")
+        if risk_notes:
+            st.markdown("**规则风险提示：**")
+            for item in risk_notes:
+                st.write(f"- {item}")
+        if ai_risk_review:
+            st.markdown("**DeepSeek 风险复核：**")
+            for item in ai_risk_review:
+                st.write(f"- {item}")
+
+    with st.expander("建议追问客户的问题"):
+        if ai_follow_up_questions:
+            for item in ai_follow_up_questions:
+                st.write(f"- {item}")
+        else:
+            st.write("暂无")
+
+    with st.expander("跟进状态"):
+        st.selectbox("当前跟进状态", ["待联系", "已联系", "补充材料中", "报价确认中", "已转合作", "暂不跟进"], key=f"follow_status_{record.get('id', '')}")
+        if next_actions:
+            st.markdown("**建议动作：**")
+            for item in next_actions:
                 st.write(f"- {item}")
         else:
             st.write("暂无")
@@ -974,6 +1429,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
